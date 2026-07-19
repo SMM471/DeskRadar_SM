@@ -26,9 +26,12 @@ Preferences preferences;
 WebServer server(80);
 
 int pollInterval = 11000; // adsb.fi is free/keyless; using the original Auth-tier interval as the default
-unsigned long lastFetchTime = 0; // The "Stopwatch" memory
 bool isConfigured = false, needsReboot = false;
 String dynamicWifiOptions = "";
+
+// Guards targets[]/numTargets, which are written by fetchTask (core 0) and
+// read by loop()'s animation/render code (core 1) at the same time.
+SemaphoreHandle_t targetsMutex;
 
 // --- Animation & Memory Arrays ---
 struct Target {
@@ -56,6 +59,7 @@ void loadConfiguration();
 void runNetworkScan();
 void renderRadarFrame();
 void advanceTargets(float dtMs);
+void fetchTask(void *parameter);
 
 void updateStatusScreen(String line1, String line2, uint16_t color) {
   tft.fillScreen(TFT_BLACK);
@@ -187,6 +191,11 @@ void setup() {
     isConfigured = true;
     pollInterval = 11000;
   }
+
+  // Fetching runs on core 0 so the sweep animation / rendering on core 1
+  // (loop()) never freezes while waiting on the network or JSON parsing.
+  targetsMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(fetchTask, "fetchTask", 8192, NULL, 1, NULL, 0);
 }
 
 void loop() {
@@ -217,36 +226,50 @@ void loop() {
     return;
   }
 
-  // --- 3. RADAR & NETWORK LOGIC ---
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.disconnect();
-    delay(500);
-    WiFi.begin(storedSsid.c_str(), storedPass.c_str());
-    for (int i = 0; i < 20; i++) {
-      if (WiFi.status() == WL_CONNECTED) break;
-      delay(500);
-    }
-    if (WiFi.status() != WL_CONNECTED) delay(5000);
-    return;
-  }
-
-  // --- 4. THE NON-BLOCKING STOPWATCH ---
-  if (lastFetchTime == 0 || millis() - lastFetchTime >= pollInterval) {
-    fetchAndMapFlights();
-    lastFetchTime = millis();
-  }
-
-  // --- 5. RENDER RADAR SCREEN (Approx 25 FPS) ---
+  // --- 3. RENDER RADAR SCREEN (Approx 25 FPS) ---
+  // Both WiFi (re)connecting and fetching now happen solely in fetchTask() on
+  // the other core - loop() never touches the WiFi stack or blocks on the
+  // network, so it's free to animate every frame without racing that task.
   if (millis() - lastDrawTime > 40) {
     float dt = millis() - lastDrawTime; // ms since last frame
-    advanceTargets(dt); // NEW: move planes smoothly based on their speed/heading
+
+    xSemaphoreTake(targetsMutex, portMAX_DELAY);
+    advanceTargets(dt); // Move planes smoothly based on their speed/heading
 
     if (enableSweep) {
       sweepAngle += 0.05; // Radar rotation speed
       if (sweepAngle > 2 * PI) sweepAngle -= 2 * PI;
     }
     renderRadarFrame();
+    xSemaphoreGive(targetsMutex);
+
     lastDrawTime = millis();
+  }
+}
+
+// Runs on core 0: independently fetches flight data on its own schedule so
+// the animation on core 1 (loop()) never has to wait on the network/JSON parsing.
+void fetchTask(void *parameter) {
+  for (;;) {
+    if (isConfigured) {
+      // Sole owner of the WiFi connection - loop() on the other core never
+      // calls WiFi.disconnect()/begin() itself anymore, avoiding the race
+      // that caused constant reconnects.
+      if (WiFi.status() != WL_CONNECTED) {
+        WiFi.disconnect();
+        delay(500);
+        WiFi.begin(storedSsid.c_str(), storedPass.c_str());
+        for (int i = 0; i < 20; i++) {
+          if (WiFi.status() == WL_CONNECTED) break;
+          delay(500);
+        }
+      }
+
+      if (WiFi.status() == WL_CONNECTED) {
+        fetchAndMapFlights();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(pollInterval));
   }
 }
 
@@ -303,8 +326,10 @@ void renderRadarFrame() {
     }
 
     if (brightness > 0) {
-      uint16_t planeColor = tft.color565(brightness, brightness, brightness);
-      uint16_t textColor = tft.color565(0, brightness, 0);
+      // A380 (ICAO type code "A388") is highlighted in red so it stands out from every other plane
+      bool isA380 = targets[i].type.startsWith("A38");
+      uint16_t planeColor = isA380 ? tft.color565(brightness, 0, 0) : tft.color565(brightness, brightness, brightness);
+      uint16_t textColor  = isA380 ? tft.color565(brightness, 0, 0) : tft.color565(0, brightness, 0);
 
       float hRad = targets[i].heading * PI / 180.0;
 
@@ -404,10 +429,15 @@ void fetchAndMapFlights() {
     JsonDocument doc; deserializeJson(doc, http.getString());
 
     JsonArray aircraft = doc["ac"].as<JsonArray>();
-    numTargets = 0; // Reset array for the new API pull
+
+    // Build into a local buffer first, so the shared targets[] array is only
+    // touched briefly at the end (under the mutex) instead of during the
+    // whole parse, which keeps the render loop on the other core unblocked.
+    static Target localTargets[30];
+    int localCount = 0;
 
     for (JsonObject plane : aircraft) {
-      if (numTargets >= 30) break; // Memory limit protection
+      if (localCount >= 30) break; // Memory limit protection
       if (plane["lat"].isNull() || plane["lon"].isNull()) continue; // No position yet
 
       float lat = plane["lat"].as<float>();
@@ -460,17 +490,24 @@ void fetchAndMapFlights() {
         pHeading = plane["track"].as<float>();
       }
 
-      // Store all data in memory array
-      targets[numTargets].x = x;
-      targets[numTargets].y = y;
-      targets[numTargets].callsign = callsign;
-      targets[numTargets].type = type;      // Middle line: aircraft type (e.g. A320)
-      targets[numTargets].altStr = altStr;  // Bottom line: altitude
-      targets[numTargets].angle = tAngle;
-      targets[numTargets].heading = pHeading; // Save for drawing triangles
-      targets[numTargets].speedKmh = gsKnots * 1.852; // Save for smooth interpolation between fetches
-      numTargets++;
+      // Store all data in the local buffer
+      localTargets[localCount].x = x;
+      localTargets[localCount].y = y;
+      localTargets[localCount].callsign = callsign;
+      localTargets[localCount].type = type;      // Middle line: aircraft type (e.g. A320)
+      localTargets[localCount].altStr = altStr;  // Bottom line: altitude
+      localTargets[localCount].angle = tAngle;
+      localTargets[localCount].heading = pHeading; // Save for drawing triangles
+      localTargets[localCount].speedKmh = gsKnots * 1.852; // Save for smooth interpolation between fetches
+      localCount++;
     }
+
+    // Publish the freshly parsed targets to the shared array in one short,
+    // locked step instead of incrementally while parsing.
+    xSemaphoreTake(targetsMutex, portMAX_DELAY);
+    for (int i = 0; i < localCount; i++) targets[i] = localTargets[i];
+    numTargets = localCount;
+    xSemaphoreGive(targetsMutex);
   } else if (httpCode == 429) {
     pollInterval = 60000;
   } else {
